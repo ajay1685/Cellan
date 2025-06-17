@@ -1,0 +1,544 @@
+import os
+import cv2
+import json
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+from torchvision import transforms
+from torchvision.models.detection import maskrcnn_resnet50_fpn
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
+
+
+
+def collate_fn(batch):
+    """Custom collate function for handling variable-sized images and targets"""
+    return tuple(zip(*batch))
+
+
+class CellDataset(Dataset):
+    """Custom dataset for cell detection using COCO format annotations"""
+    
+    def __init__(self, annotation_path, img_dir, transform=None):
+        self.img_dir = img_dir
+        self.transform = transform
+        self.annotation_data = json.load(open(annotation_path))
+        
+        # Define conversion from PIL Image to tensor
+        self.to_tensor = transforms.ToTensor()
+        
+        # Process COCO annotations
+        self.images = {img['id']: img for img in self.annotation_data['images']}
+        self.annotations = {}
+        
+        # Group annotations by image_id
+        for ann in self.annotation_data['annotations']:
+            image_id = ann['image_id']
+            if image_id not in self.annotations:
+                self.annotations[image_id] = []
+            self.annotations[image_id].append(ann)
+            
+        # Get category mapping
+        self.categories = {}
+        for cat in self.annotation_data['categories']:
+            self.categories[cat['id']] = cat['name']
+            
+        # Create image_ids list for __getitem__
+        self.image_ids = list(self.annotations.keys())
+        
+    def __len__(self):
+        return len(self.image_ids)
+    
+    def __getitem__(self, idx):
+        image_id = self.image_ids[idx]
+        image_info = self.images[image_id]
+        file_name = os.path.join(self.img_dir, image_info['file_name'])
+        
+        # Load image and convert to tensor directly
+        img = Image.open(file_name).convert("RGB")
+        img_tensor = self.to_tensor(img)  # Convert PIL Image to tensor
+        
+        # Process annotations
+        annotations = self.annotations[image_id]
+        boxes = []
+        labels = []
+        masks = []
+        
+        for ann in annotations:
+            x, y, w, h = ann['bbox']
+            
+            # Add validation to ensure non-zero width and height
+            # Add a small epsilon (e.g., 1.0) to ensure boxes have positive dimensions
+            if w < 1.0:
+                w = 1.0
+            if h < 1.0:
+                h = 1.0
+                
+            boxes.append([x, y, x + w, y + h])  # Convert to [x1, y1, x2, y2]
+            labels.append(ann['category_id'])
+            
+            # Create binary mask from segmentation
+            if 'segmentation' in ann:
+                mask = self._create_mask(ann['segmentation'], image_info['height'], image_info['width'])
+                masks.append(mask)
+        
+        # Convert to tensors
+        boxes = torch.as_tensor(boxes, dtype=torch.float32)
+        labels = torch.as_tensor(labels, dtype=torch.int64)
+        image_id = torch.tensor([idx])
+        area = (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0])
+        
+        # Assume all instances are not crowd
+        iscrowd = torch.zeros((len(annotations),), dtype=torch.int64)
+        
+        # Create target dictionary
+        target = {
+            'boxes': boxes,
+            'labels': labels,
+            'image_id': image_id,
+            'area': area,
+            'iscrowd': iscrowd
+        }
+        
+        if len(masks) > 0:
+            target['masks'] = torch.as_tensor(np.stack(masks), dtype=torch.uint8)
+        
+        if self.transform is not None:
+            img, target = self.transform(img, target)
+        
+        # Return tensor instead of PIL Image
+        return img_tensor, target
+    
+    def _create_mask(self, segmentation, height, width):
+        """Create binary mask from segmentation data"""
+        mask = np.zeros((height, width), dtype=np.uint8)
+        for seg in segmentation:
+            # For polygon segmentation
+            if isinstance(seg, list) and len(seg) > 4:
+                poly = np.array(seg).reshape(-1, 2)
+                cv2.fillPoly(mask, [poly.astype(np.int32)], 1)
+        return mask
+
+
+class Detector:
+    def __init__(self):
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.cell_mapping = None
+        self.inferencing_framesize = None
+        self.black_background = None
+        self.current_detector = None
+
+    def _get_model(self, num_classes):
+        """Create a Mask R-CNN model with custom number of classes"""
+        # Use weights="DEFAULT" instead of pretrained=True
+        from torchvision.models.detection.mask_rcnn import MaskRCNN_ResNet50_FPN_Weights
+        
+        model = maskrcnn_resnet50_fpn(weights=MaskRCNN_ResNet50_FPN_Weights.DEFAULT)
+        
+        # Replace classification head
+        in_features = model.roi_heads.box_predictor.cls_score.in_features
+        model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+        
+        # Replace mask head
+        in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
+        hidden_layer = 256
+        model.roi_heads.mask_predictor = MaskRCNNPredictor(
+            in_features_mask, hidden_layer, num_classes)
+        
+        return model
+
+    def train(self, path_to_annotation, path_to_trainingimages, path_to_detector, 
+              iteration_num, inference_size, num_rois, black_background=0):
+        """Train a cell detection model"""
+        # Create output directory
+        os.makedirs(path_to_detector, exist_ok=True)
+        
+        # Load and parse annotation file
+        annotation_data = json.load(open(path_to_annotation))
+        cell_names = []
+        for i in annotation_data['categories']:
+            if i['id'] > 0:
+                cell_names.append(i['name'])
+        
+        print('Cell names in annotation file: ' + str(cell_names))
+        
+        # Create dataset
+        dataset = CellDataset(path_to_annotation, path_to_trainingimages)
+        
+        # Calculate epochs based on iterations and dataset size
+        batch_size = 4  # Similar to Detectron2 IMS_PER_BATCH
+        epochs = max(1, iteration_num // (len(dataset) // batch_size + 1))
+        
+        # Create data loader - replace the lambda with the imported function
+        data_loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=4,
+            collate_fn=collate_fn  # Use the function defined outside the class
+        )
+        
+        # Create model
+        num_classes = len(cell_names) + 1  # +1 for background class
+        model = self._get_model(num_classes)
+        model.to(self.device)
+        
+        # Set up optimizer
+        params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = optim.SGD(
+            params, 
+            lr=0.001, 
+            momentum=0.9, 
+            weight_decay=0.0005
+        )
+        
+        # Learning rate scheduler
+        lr_scheduler = optim.lr_scheduler.MultiStepLR(
+            optimizer, 
+            milestones=[int(epochs*0.4), int(epochs*0.8)],
+            gamma=0.5
+        )
+        
+        # Training loop
+        print("Starting training...")
+        model.train()
+        for epoch in range(epochs):
+            running_loss = 0.0
+            for i, (images, targets) in enumerate(data_loader):
+                # Move to device
+                images = list(image.to(self.device) for image in images)
+                targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
+                
+                # Forward pass
+                loss_dict = model(images, targets)
+                losses = sum(loss for loss in loss_dict.values())
+                
+                # Backward pass
+                optimizer.zero_grad()
+                losses.backward()
+                optimizer.step()
+                
+                # Print progress
+                running_loss += losses.item()
+                if i % 20 == 19:  # print every 20 mini-batches
+                    print(f'Epoch {epoch + 1}/{epochs}, Batch {i + 1}, Loss: {running_loss / 20:.3f}')
+                    running_loss = 0.0
+            
+            # Update learning rate
+            lr_scheduler.step()
+            
+            print(f'Completed epoch {epoch + 1}/{epochs}')
+        
+        # Save model
+        torch.save(model.state_dict(), os.path.join(path_to_detector, 'model_final.pth'))
+        
+        # Save model parameters
+        model_parameters_dict = {
+            'cell_names': cell_names,
+            'inferencing_framesize': int(inference_size),
+            'black_background': int(black_background),
+            'cell_mapping': {i: name for i, name in enumerate(cell_names)}
+        }
+        
+        with open(os.path.join(path_to_detector, 'model_parameters.txt'), 'w') as f:
+            f.write(json.dumps(model_parameters_dict))
+        
+        # Save config
+        config = {
+            'num_classes': num_classes,
+            'inference_size': inference_size,
+        }
+        
+        with open(os.path.join(path_to_detector, 'config.yaml'), 'w') as f:
+            f.write(json.dumps(config))
+        
+        print('Detector training completed!')
+
+    def test(self, path_to_annotation, path_to_testingimages, path_to_detector, output_path):
+        """Test trained detector on test data"""
+        os.makedirs(output_path, exist_ok=True)
+        
+        # Load model parameters
+        with open(os.path.join(path_to_detector, 'model_parameters.txt')) as f:
+            model_parameters = json.loads(f.read())
+        
+        cell_names = model_parameters['cell_names']
+        inference_size = int(model_parameters['inferencing_framesize'])
+        bg = int(model_parameters['black_background'])
+        
+        print('The total categories of cells in this Detector: ' + str(cell_names))
+        print('The inferencing framesize of this Detector: ' + str(inference_size))
+        if bg == 0:
+            print('The images that can be analyzed by this Detector have black/darker background')
+        else:
+            print('The images that can be analyzed by this Detector have white/lighter background')
+            
+        # Load config
+        with open(os.path.join(path_to_detector, 'config.yaml')) as f:
+            config = json.loads(f.read())
+        
+        # Create model
+        num_classes = len(cell_names) + 1
+        model = self._get_model(num_classes)
+        model.load_state_dict(torch.load(os.path.join(path_to_detector, 'model_final.pth')))
+        model.to(self.device)
+        model.eval()
+        
+        # Create test dataset
+        test_dataset = CellDataset(path_to_annotation, path_to_testingimages)
+        
+        # Use the collate_fn defined at module level instead of lambda
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=4,
+            collate_fn=collate_fn  # Use the function defined outside the class
+        )
+        
+        # Metrics for evaluation
+        results = {
+            'pred_boxes': [],
+            'pred_classes': [],
+            'pred_scores': [],
+            'gt_boxes': [],
+            'gt_classes': []
+        }
+        
+        # Inference
+        with torch.no_grad():
+            for images, targets in test_loader:
+                images = list(img.to(self.device) for img in images)
+                outputs = model(images)
+                
+                # Process results for each image
+                for i, (output, target) in enumerate(zip(outputs, targets)):
+                    # Get image path from test_dataset
+                    image_id = target['image_id'].item()
+                    image_info = test_dataset.images[test_dataset.image_ids[image_id]]
+                    img_path = os.path.join(path_to_testingimages, image_info['file_name'])
+                    
+                    # Load original image for visualization
+                    orig_img = cv2.imread(img_path)
+                    
+                    # Draw predictions
+                    pred_img = self._draw_predictions(
+                        orig_img.copy(), 
+                        output['boxes'].cpu().numpy(),
+                        output['labels'].cpu().numpy(),
+                        output['scores'].cpu().numpy(),
+                        cell_names
+                    )
+                    
+                    # Save output image
+                    cv2.imwrite(
+                        os.path.join(output_path, os.path.basename(img_path)),
+                        pred_img
+                    )
+                    
+                    # Collect results for evaluation
+                    results['pred_boxes'].append(output['boxes'].cpu().numpy())
+                    results['pred_classes'].append(output['labels'].cpu().numpy())
+                    results['pred_scores'].append(output['scores'].cpu().numpy())
+                    results['gt_boxes'].append(target['boxes'].cpu().numpy())
+                    results['gt_classes'].append(target['labels'].cpu().numpy())
+        
+        # Calculate mAP
+        mAP = self._calculate_map(results)
+        
+        print(f'The mean average precision (mAP) of the Detector is: {mAP:.4f}%.')
+        print('Detector testing completed!')
+
+    def _draw_predictions(self, image, boxes, labels, scores, class_names, threshold=0.5):
+        """Draw bounding boxes and labels on image"""
+        for box, label, score in zip(boxes, labels, scores):
+            if score >= threshold:
+                x1, y1, x2, y2 = box.astype(int)
+                
+                # Get class name (subtract 1 since label 0 is background)
+                class_name = class_names[label - 1] if label > 0 and label <= len(class_names) else f"Class {label}"
+                
+                # Draw box
+                cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                
+                # Draw label
+                cv2.putText(
+                    image, 
+                    f"{class_name} {score:.2f}", 
+                    (x1, y1 - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 
+                    0.5, 
+                    (0, 255, 0), 
+                    1
+                )
+        
+        return image
+
+    def _calculate_map(self, results, iou_threshold=0.5):
+        """Calculate mean Average Precision"""
+        # This is a simplified mAP calculation
+        # For a more robust implementation, consider using the pycocotools library
+        
+        def calculate_iou(boxA, boxB):
+            # Calculate intersection over union
+            xA = max(boxA[0], boxB[0])
+            yA = max(boxA[1], boxB[1])
+            xB = min(boxA[2], boxB[2])
+            yB = min(boxA[3], boxB[3])
+            
+            interArea = max(0, xB - xA) * max(0, yB - yA)
+            boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+            boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+            
+            iou = interArea / float(boxAArea + boxBArea - interArea)
+            return iou
+        
+        # Initialize AP for each class
+        all_classes = set()
+        for classes in results['gt_classes']:
+            all_classes.update(classes)
+        
+        average_precisions = []
+        
+        # Calculate AP for each class
+        for img_idx in range(len(results['pred_boxes'])):
+            pred_boxes = results['pred_boxes'][img_idx]
+            pred_classes = results['pred_classes'][img_idx]
+            pred_scores = results['pred_scores'][img_idx]
+            gt_boxes = results['gt_boxes'][img_idx]
+            gt_classes = results['gt_classes'][img_idx]
+            
+            # Sort predictions by score
+            indices = np.argsort(-pred_scores)
+            pred_boxes = pred_boxes[indices]
+            pred_classes = pred_classes[indices]
+            pred_scores = pred_scores[indices]
+            
+            # Calculate precision and recall
+            tp = np.zeros(len(pred_boxes))
+            fp = np.zeros(len(pred_boxes))
+            
+            # Mark which ground-truth boxes have been detected
+            detected_gt = [False] * len(gt_boxes)
+            
+            for pred_idx, (pred_box, pred_class) in enumerate(zip(pred_boxes, pred_classes)):
+                # Find best matching ground truth box
+                best_iou = 0
+                best_gt_idx = -1
+                
+                for gt_idx, (gt_box, gt_class) in enumerate(zip(gt_boxes, gt_classes)):
+                    # Only consider ground truth with same class
+                    if gt_class != pred_class:
+                        continue
+                    
+                    # Calculate IoU
+                    iou = calculate_iou(pred_box, gt_box)
+                    
+                    # Select best matching ground truth
+                    if iou > best_iou and not detected_gt[gt_idx]:
+                        best_iou = iou
+                        best_gt_idx = gt_idx
+                
+                # If IoU exceeds threshold, it's a true positive
+                if best_iou >= iou_threshold:
+                    tp[pred_idx] = 1
+                    detected_gt[best_gt_idx] = True
+                else:
+                    fp[pred_idx] = 1
+            
+            # Calculate precision and recall
+            tp_cumsum = np.cumsum(tp)
+            fp_cumsum = np.cumsum(fp)
+            recalls = tp_cumsum / max(1, len(gt_boxes))
+            precisions = tp_cumsum / (tp_cumsum + fp_cumsum)
+            
+            # Add sentinel values for AP calculation
+            precisions = np.concatenate(([0], precisions, [0]))
+            recalls = np.concatenate(([0], recalls, [1]))
+            
+            # Ensure precision decreases
+            for i in range(len(precisions) - 2, -1, -1):
+                precisions[i] = max(precisions[i], precisions[i + 1])
+            
+            # Calculate AP using precision recall curve
+            indices = np.where(recalls[1:] != recalls[:-1])[0]
+            ap = np.sum((recalls[indices + 1] - recalls[indices]) * precisions[indices + 1])
+            average_precisions.append(ap)
+        
+        # Return mAP if there are detections, otherwise 0
+        return np.mean(average_precisions) * 100 if average_precisions else 0.0
+
+    def load(self, path_to_detector, cell_kinds):
+        """Load a trained detector model"""
+        # Load model parameters
+        with open(os.path.join(path_to_detector, 'model_parameters.txt')) as f:
+            model_parameters = json.loads(f.read())
+        
+        self.cell_mapping = model_parameters['cell_mapping']
+        cell_names = model_parameters['cell_names']
+        self.inferencing_framesize = int(model_parameters['inferencing_framesize'])
+        bg = int(model_parameters['black_background'])
+        
+        print('The total categories of cells in this Detector: ' + str(cell_names))
+        print('The cells of interest in this Detector: ' + str(cell_kinds))
+        print('The inferencing framesize of this Detector: ' + str(self.inferencing_framesize))
+        
+        if bg == 0:
+            self.black_background = True
+            print('The images that can be analyzed by this Detector have black/darker background')
+        else:
+            self.black_background = False
+            print('The images that can be analyzed by this Detector have white/lighter background')
+        
+        # Load config
+        with open(os.path.join(path_to_detector, 'config.yaml')) as f:
+            config = json.loads(f.read())
+        
+        # Create model
+        num_classes = len(cell_names) + 1  # +1 for background
+        model = self._get_model(num_classes)
+        model.load_state_dict(torch.load(os.path.join(path_to_detector, 'model_final.pth')))
+        model.to(self.device)
+        model.eval()
+        
+        self.current_detector = model
+
+    def inference(self, inputs):
+        """Run inference on input images"""
+        if self.current_detector is None:
+            raise ValueError("No detector model loaded. Call load() first.")
+        
+        # Convert inputs to PyTorch format
+        if isinstance(inputs, list) and isinstance(inputs[0], torch.Tensor):
+            # If inputs are already PyTorch tensors, use them directly
+            images = [img.to(self.device) for img in inputs]
+        elif isinstance(inputs, np.ndarray):
+            # Single image as numpy array
+            if inputs.ndim == 3:  # RGB image
+                image = torch.from_numpy(inputs.transpose(2, 0, 1)).float() / 255.0
+                image = image.to(self.device)
+                images = [image]
+            else:
+                raise ValueError("Input numpy array should have 3 dimensions (H,W,C)")
+        else:
+            # List of numpy arrays
+            images = []
+            for img in inputs:
+                if img.ndim == 3:  # RGB image
+                    image = torch.from_numpy(img.transpose(2, 0, 1)).float() / 255.0
+                    image = image.to(self.device)
+                    images.append(image)
+                else:
+                    raise ValueError("Each input array should have 3 dimensions (H,W,C)")
+    
+        # Run inference
+        with torch.no_grad():
+            self.current_detector.eval()
+            outputs = self.current_detector(images)
+    
+        return outputs
