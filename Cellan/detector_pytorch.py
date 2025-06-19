@@ -1,25 +1,45 @@
+import datetime
 import os
 import cv2
 import json
 import torch
-import torch.nn as nn
+import math
 import torch.optim as optim
-import torchvision
 from torchvision import transforms
-from torchvision.models.detection import maskrcnn_resnet50_fpn
+from torchvision.models.detection import maskrcnn_resnet50_fpn_v2
+from torchvision.models.detection.mask_rcnn import MaskRCNN_ResNet50_FPN_V2_Weights
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+from torch.optim.lr_scheduler import LambdaLR, MultiStepLR, SequentialLR
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
 
 
-
 def collate_fn(batch):
     """Custom collate function for handling variable-sized images and targets"""
     return tuple(zip(*batch))
 
+# Create custom learning rate scheduler to match Detectron2 behavior
+class WarmupMultiStepLR(torch.optim.lr_scheduler._LRScheduler):
+    def __init__(self, optimizer, total_iters, warmup_iters, steps, gamma=0.5, last_epoch=-1):
+        self.warmup_iters = warmup_iters
+        self.steps = sorted(steps)
+        self.gamma = gamma
+        self.total_iters = total_iters
+        super().__init__(optimizer, last_epoch)
+    
+    def get_lr(self):
+        if self.last_epoch < self.warmup_iters:
+            # Linear warmup
+            alpha = float(self.last_epoch) / self.warmup_iters
+            warmup_factor = (1.0 - alpha) * (1.0/3.0) + alpha  # Start from lr/3 and increase linearly
+            return [base_lr * warmup_factor for base_lr in self.base_lrs]
+        else:
+            # Step decay at specific iterations
+            decay_factor = self.gamma ** sum(self.last_epoch >= step for step in self.steps)
+            return [base_lr * decay_factor for base_lr in self.base_lrs]
 
 class CellDataset(Dataset):
     """Custom dataset for cell detection using COCO format annotations"""
@@ -136,9 +156,9 @@ class Detector:
     def _get_model(self, num_classes):
         """Create a Mask R-CNN model with custom number of classes"""
         # Use weights="DEFAULT" instead of pretrained=True
-        from torchvision.models.detection.mask_rcnn import MaskRCNN_ResNet50_FPN_Weights
         
-        model = maskrcnn_resnet50_fpn(weights=MaskRCNN_ResNet50_FPN_Weights.DEFAULT)
+        
+        model = maskrcnn_resnet50_fpn_v2(weights=MaskRCNN_ResNet50_FPN_V2_Weights.DEFAULT)
         
         # Replace classification head
         in_features = model.roi_heads.box_predictor.cls_score.in_features
@@ -172,7 +192,7 @@ class Detector:
         
         # Calculate epochs based on iterations and dataset size
         batch_size = 4  # Similar to Detectron2 IMS_PER_BATCH
-        epochs = max(1, iteration_num // (len(dataset) // batch_size + 1))
+        base_lr = 0.001  # cfg.SOLVER.BASE_LR
         
         # Create data loader - replace the lambda with the imported function
         data_loader = DataLoader(
@@ -186,30 +206,63 @@ class Detector:
         # Create model
         num_classes = len(cell_names) + 1  # +1 for background class
         model = self._get_model(num_classes)
+
+        # Configure ROI heads batch size
+        if hasattr(model, 'roi_heads'):
+            model.roi_heads.batch_size_per_image = num_rois  # Similar to cfg.MODEL.ROI_HEADS.BATCH_SIZE_PER_IMAGE
+            model.roi_heads.score_thresh = 0.5  # Similar to cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST
+    
         model.to(self.device)
         
         # Set up optimizer
         params = [p for p in model.parameters() if p.requires_grad]
-        optimizer = optim.SGD(
-            params, 
-            lr=0.001, 
-            momentum=0.9, 
-            weight_decay=0.0005
-        )
+        optimizer = optim.SGD(params, lr=base_lr, momentum=0.9, weight_decay=0.0001)
         
-        # Learning rate scheduler
-        lr_scheduler = optim.lr_scheduler.MultiStepLR(
+        # Calculate training iterations and schedule breakpoints
+        # Use exact iteration numbers rather than epochs to match Detectron2
+        total_iters = iteration_num
+        current_iter = 0
+        
+        # Define warmup phase duration
+        warmup_iters = int(total_iters * 0.1)  # 10% of total iterations for warmup
+
+            # Define the step points at 40% and 80% of total iterations
+        steps = [
+            int(total_iters * 0.4),  # First step at 40% of training
+            int(total_iters * 0.8)   # Second step at 80% of training
+        ]
+        # Create our custom scheduler
+        lr_scheduler = WarmupMultiStepLR(
             optimizer, 
-            milestones=[int(epochs*0.4), int(epochs*0.8)],
-            gamma=0.5
+            total_iters=total_iters,
+            warmup_iters=warmup_iters,
+            steps=steps,
+            gamma=0.5  # Matches your cfg.SOLVER.GAMMA
         )
-        
+
+        # Calculate epochs based on iterations and dataset size for progress tracking
+        # This is just for display purposes, actual scheduling is iteration-based
+        batches_per_epoch = len(data_loader)
+        epochs = max(1, math.ceil(total_iters / batches_per_epoch))
+
+        # Learning rate scheduler
+        # lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[int(epochs*0.4), int(epochs*0.8)], gamma=0.5)
+        # Learning rate scheduler; adjusts the learning rate during training
+        #lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.001, total_steps=epochs*len(dataset))
+
         # Training loop
         print("Starting training...")
+
         model.train()
-        for epoch in range(epochs):
-            running_loss = 0.0
+        running_loss = 0.0
+        epoch = 0
+        
+        while current_iter < total_iters:
+            epoch += 1
+            
             for i, (images, targets) in enumerate(data_loader):
+                current_iter += 1
+                
                 # Move to device
                 images = list(image.to(self.device) for image in images)
                 targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
@@ -223,16 +276,18 @@ class Detector:
                 losses.backward()
                 optimizer.step()
                 
+                # Update learning rate each iteration (like Detectron2)
+                lr_scheduler.step()
+                
                 # Print progress
                 running_loss += losses.item()
-                if i % 20 == 19:  # print every 20 mini-batches
-                    print(f'Epoch {epoch + 1}/{epochs}, Batch {i + 1}, Loss: {running_loss / 20:.3f}')
-                    running_loss = 0.0
-            
-            # Update learning rate
-            lr_scheduler.step()
-            
-            print(f'Completed epoch {epoch + 1}/{epochs}')
+                print(f"Iteration: {current_iter}/{total_iters}, Epoch: {epoch}/{epochs}, "
+                    f"Batch: {i+1}/{len(data_loader)}, Loss: {losses.item():.4f}, "
+                    f"LR: {optimizer.param_groups[0]['lr']:.7f}")
+                
+                if current_iter >= total_iters:
+                    break
+
         
         # Save model
         torch.save(model.state_dict(), os.path.join(path_to_detector, 'model_final.pth'))
@@ -542,3 +597,4 @@ class Detector:
             outputs = self.current_detector(images)
     
         return outputs
+
