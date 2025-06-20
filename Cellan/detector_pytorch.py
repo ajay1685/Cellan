@@ -10,12 +10,55 @@ from torchvision.models.detection import maskrcnn_resnet50_fpn_v2
 from torchvision.models.detection.mask_rcnn import MaskRCNN_ResNet50_FPN_V2_Weights
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
-from torch.optim.lr_scheduler import LambdaLR, MultiStepLR, SequentialLR
 from torch.utils.data import Dataset, DataLoader
+from types import SimpleNamespace
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
 
+
+class Boxes:
+    """A minimal Boxes implementation matching Detectron2's API used by Instances"""
+    def __init__(self, tensor):
+        self.tensor = tensor
+    
+    def __len__(self):
+        return self.tensor.shape[0]
+    
+    def to(self, device):
+        return Boxes(self.tensor.to(device))
+    
+    def clone(self):
+        return Boxes(self.tensor.clone())
+
+class Instances:
+    """A minimal Instances implementation matching Detectron2's API"""
+    def __init__(self, image_size, **kwargs):
+        self._image_size = image_size
+        self._fields = {}
+        for k, v in kwargs.items():
+            self._fields[k] = v
+    
+    @property
+    def image_size(self):
+        return self._image_size
+    
+    def __getattr__(self, name):
+        if name == "_fields" or name not in self._fields:
+            raise AttributeError(f"{name} not found in Instances")
+        return self._fields[name]
+    
+    def has(self, name):
+        return name in self._fields
+    
+    def to(self, device):
+        new_fields = {}
+        for k, v in self._fields.items():
+            if hasattr(v, "to"):
+                new_fields[k] = v.to(device)
+            else:
+                new_fields[k] = v
+        return Instances(self._image_size, **new_fields)
 
 def collate_fn(batch):
     """Custom collate function for handling variable-sized images and targets"""
@@ -563,38 +606,105 @@ class Detector:
         
         self.current_detector = model
 
+  
+
     def inference(self, inputs):
-        """Run inference on input images"""
+        """Run inference on input images and return Detectron2-like output"""
         if self.current_detector is None:
             raise ValueError("No detector model loaded. Call load() first.")
         
-        # Convert inputs to PyTorch format
-        if isinstance(inputs, list) and isinstance(inputs[0], torch.Tensor):
-            # If inputs are already PyTorch tensors, use them directly
-            images = [img.to(self.device) for img in inputs]
-        elif isinstance(inputs, np.ndarray):
-            # Single image as numpy array
-            if inputs.ndim == 3:  # RGB image
-                image = torch.from_numpy(inputs.transpose(2, 0, 1)).float() / 255.0
-                image = image.to(self.device)
-                images = [image]
-            else:
-                raise ValueError("Input numpy array should have 3 dimensions (H,W,C)")
-        else:
-            # List of numpy arrays
-            images = []
-            for img in inputs:
-                if img.ndim == 3:  # RGB image
-                    image = torch.from_numpy(img.transpose(2, 0, 1)).float() / 255.0
+        outputs = []
+        
+        for inp in inputs:
+            # Handle input format - your analyzer passes {'image': tensor}
+            if isinstance(inp, dict) and 'image' in inp:
+                image = inp['image']
+                if isinstance(image, torch.Tensor):
+                    # If already a tensor, use it directly
                     image = image.to(self.device)
-                    images.append(image)
                 else:
-                    raise ValueError("Each input array should have 3 dimensions (H,W,C)")
-    
-        # Run inference
-        with torch.no_grad():
-            self.current_detector.eval()
-            outputs = self.current_detector(images)
-    
+                    # Otherwise convert to tensor
+                    image = torch.as_tensor(image, device=self.device)
+            elif isinstance(inp, torch.Tensor):
+                # If input is directly a tensor
+                image = inp.to(self.device)
+            elif isinstance(inp, np.ndarray):
+                # If input is a numpy array, convert to tensor
+                if inp.ndim == 3:  # HWC format
+                    image = torch.from_numpy(inp.transpose(2, 0, 1)).float().to(self.device)
+                elif inp.ndim == 4:  # NHWC format
+                    image = torch.from_numpy(inp.transpose(0, 3, 1, 2)).float().to(self.device)
+                else:
+                    raise ValueError(f"Invalid input shape: {inp.shape}")
+            else:
+                raise ValueError(f"Unsupported input type: {type(inp)}")
+            
+            # Normalize if needed (depends on your model)
+            if image.max() > 1.0:
+                image = image / 255.0
+                
+            # Get original image height and width
+            if image.dim() == 4:  # Batch of images (B, C, H, W)
+                height, width = image.shape[2], image.shape[3]
+            else:  # Single image (C, H, W)
+                height, width = image.shape[1], image.shape[2]
+                # Add batch dimension if needed
+                if image.dim() == 3:
+                    image = image.unsqueeze(0)
+            
+            # Run inference
+            with torch.no_grad():
+                self.current_detector.eval()
+                predictions = self.current_detector(image)
+            
+            # Process predictions from PyTorch model
+            if isinstance(predictions, list):
+                # Assuming first item in batch
+                prediction = predictions[0]
+            else:
+                prediction = predictions
+                
+            # Extract relevant outputs
+            boxes = prediction.get("boxes", torch.empty(0, 4, device=self.device))
+            scores = prediction.get("scores", torch.empty(0, device=self.device))
+            labels = prediction.get("labels", torch.empty(0, dtype=torch.int64, device=self.device))
+            masks = prediction.get("masks", None)
+            
+            # IMPORTANT: Adjust class IDs to be 0-indexed if they're 1-indexed
+            # Check if we need to shift class IDs based on the cell_mapping
+            if len(labels) > 0 and torch.min(labels).item() > 0:
+                # If the minimum label is greater than 0, we need to adjust
+                # This assumes your model uses 1-indexing but cell_mapping expects 0-indexing
+                labels = labels - 1
+            
+            # Format masks properly
+            if masks is not None:
+                if masks.dim() == 4 and masks.shape[1] == 1:  # (N, 1, H, W)
+                    masks = masks.squeeze(1)  # Convert to (N, H, W)
+                elif masks.dim() == 3:
+                    # Already in correct format (N, H, W)
+                    pass
+                else:
+                    raise ValueError(f"Unexpected mask shape: {masks.shape}")
+                    
+                # Ensure masks are binary
+                if masks.dtype != torch.bool:
+                    masks = masks > 0.5
+            
+            # Create Instances object with fields
+            instances = Instances(
+                image_size=(height, width),
+                pred_boxes=Boxes(boxes),
+                scores=scores,
+                pred_classes=labels,
+                pred_masks=masks if masks is not None else torch.empty(0, height, width, dtype=torch.bool, device=self.device)
+            )
+            
+            # Package in Detectron2-like format
+            outputs.append({"instances": instances})
+        
+        # Return the outputs according to input format
+        if len(outputs) == 1:
+            return outputs
+        
         return outputs
-
